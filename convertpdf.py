@@ -10,28 +10,6 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 
-def create_empty_pdf(pdf_path):
-    """Создает пустой PDF файл."""
-    logging.info(f"Создание пустого PDF файла по пути: {pdf_path}")
-    c = canvas.Canvas(str(pdf_path))
-    c.save()
-    logging.info(f"Пустой PDF файл создан: {pdf_path}")
-
-async def update_status(bot, chat_id, message_id, new_text):
-    """Обновляет статус сообщения."""
-    try:
-        if message_id is not None:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        logging.error(f"Ошибка при удалении сообщения: {e}")
-    
-    try:
-        new_message = await bot.send_message(chat_id=chat_id, text=new_text)
-        return new_message.message_id
-    except Exception as e:
-        logging.error(f"Ошибка при отправке нового сообщения: {e}")
-        return None
-
 async def auto_scroll(page, temp_dir):
     """Прокручивает страницу и делает скриншоты."""
     viewport_height = 1080
@@ -129,21 +107,9 @@ async def convert_to_pdf(image_path, temp_dir):
     
     return pdf_path
 
-async def generate_pdf(url, temp_dir, bot, chat_id, message_id):
+async def generate_pdf(url, temp_dir):
     """Создает PDF из URL и возвращает путь к файлу."""
-    progress_messages = [
-        "🕑 Подготовка...",
-        "🔍 Обработка...",
-        "📜 Генерация...",
-        "💾 Завершение..."
-    ]
-    
-    empty_pdf_path = temp_dir / 'output_fullpage.pdf'
-    create_empty_pdf(empty_pdf_path)
-    
     try:
-        message_id = await update_status(bot, chat_id, message_id, progress_messages[0])
-        
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -154,8 +120,6 @@ async def generate_pdf(url, temp_dir, bot, chat_id, message_id):
             await page.add_style_tag(content='.w-webflow-badge, a.buy-this-template.w-inline-block, a.all-templates.w-inline-block, div.hire-popup, div.hireus-badge-wrapper, div.promotion-labels-wrapper, div.buy-template, div.hire-us{ opacity: 0 !important; }')
 
             await asyncio.sleep(5)
-            
-            message_id = await update_status(bot, chat_id, message_id, progress_messages[1])
 
             logging.info("Начало автоскроллинга")
 
@@ -163,13 +127,9 @@ async def generate_pdf(url, temp_dir, bot, chat_id, message_id):
             
             logging.info("Автоскроллинг завершен, объединение скриншотов")
             
-            message_id = await update_status(bot, chat_id, message_id, progress_messages[2])
-
             full_screenshot_path = await merge_screenshots(screenshots, temp_dir)
             pdf_path = await convert_to_pdf(full_screenshot_path, temp_dir)
             
-            message_id = await update_status(bot, chat_id, message_id, progress_messages[3])
-
             logging.info(f'PDF создан: {pdf_path}')
 
             return str(pdf_path)
