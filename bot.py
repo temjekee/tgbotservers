@@ -1,13 +1,23 @@
 import logging
 import asyncio
+import uuid
+import shutil
+import aiofiles
+from pathlib import Path
+from telegram.error import BadRequest
+from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext, filters, CallbackQueryHandler
 from webflow import get_templates, get_random_template
 from convertpdf import generate_pdf
 from config import TOKEN
+from concurrent.futures import ThreadPoolExecutor
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# Пул потоков для работы с блокирующими задачами
+executor = ThreadPoolExecutor(max_workers=5)
 
 # Глобальный словарь для хранения данных о PDF по сообщениям
 pdf_data = {}  # message_id -> template_url
@@ -43,14 +53,28 @@ category_mapping = {
 }
 
 # Кнопки обратной связи и генерации нового PDF
-CONTACT_BUTTON = InlineKeyboardButton("Мне понравилось, хочу чтобы со мной связались", callback_data='contact')
-NEW_PDF_BUTTON = InlineKeyboardButton("Сгенерировать еще один PDF", callback_data='new_pdf')
+CONTACT_BUTTON = InlineKeyboardButton("Мне понравилось, свяжитесь со мной!", callback_data='contact')
+NEW_PDF_BUTTON = InlineKeyboardButton("Сгенерировать еще один вариант!", callback_data='new_pdf')
+
+TEMP_DIRS = {}  # {temp_dir: creation_time}
+
+async def cleanup_temp_dirs(context: CallbackContext) -> None:
+    """Фоновая задача для очистки старых временных директорий."""
+    now = datetime.now()
+    for temp_dir, creation_time in list(TEMP_DIRS.items()):
+        if now - creation_time > timedelta(minutes=5):
+            try:
+                shutil.rmtree(temp_dir)
+                logging.info(f"Временная директория {temp_dir} успешно удалена через 5 минут.")
+                TEMP_DIRS.pop(temp_dir)
+            except Exception as e:
+                logging.error(f"Ошибка при удалении временной директории {temp_dir}: {e}")
 
 async def start(update: Update, context: CallbackContext) -> None:
     logging.info("Received /start command")
     reply_markup = ReplyKeyboardMarkup(CATEGORY_BUTTONS, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        'Привет! Выберите категорию для поиска шаблонов:',
+        'Привет! Я бот компании InChain Digital. Можешь выбрать категорию и я тебя покажу, как твой сайт мог бы выглядеть!',
         reply_markup=reply_markup
     )
 
@@ -58,68 +82,10 @@ async def handle_category_selection(update: Update, context: CallbackContext) ->
     category = update.message.text
     if category in category_mapping:
         category_key = category_mapping[category]
-        context.user_data['current_category'] = category_key  # Сохраняем текущую категорию для повторного использования
+        context.user_data['current_category'] = category_key
         await generate_and_send_pdf(update, context, category, category_key)
     else:
         await update.message.reply_text('Вы выбрали неизвестную категорию. Пожалуйста, выберите одну из предложенных кнопок.')
-
-async def generate_and_send_pdf(update: Update, context: CallbackContext, category: str, category_key: str) -> None:
-    templates = get_templates(category_key)
-    logging.info(f"Templates found: {templates}")
-
-    if templates:
-        template = get_random_template(templates)
-        logging.info(f"Selected template: {template}")
-        if template:
-            # Сохраняем статус ожидания перед созданием PDF
-            if update.message:
-                waiting_message = await update.message.reply_text(
-                    f'Вот случайный шаблон для категории {category}: {template}\n\nСоздание PDF... Пожалуйста, подождите.'
-                )
-            else:
-                # При работе через callback_query
-                waiting_message = await context.bot.send_message(
-                    chat_id=update.callback_query.message.chat_id,
-                    text=f'Вот случайный шаблон для категории {category}: {template}\n\nСоздание PDF... Пожалуйста, подождите.'
-                )
-
-            try:
-                pdf_path = await asyncio.wait_for(generate_pdf(template, waiting_message.chat_id, waiting_message.message_id, context.bot), timeout=1000)
-                if pdf_path:
-                    with open(pdf_path, 'rb') as pdf_file:
-                        reply_markup = InlineKeyboardMarkup([[CONTACT_BUTTON], [NEW_PDF_BUTTON]])
-
-                        if update.message:
-                            sent_message = await update.message.reply_document(pdf_file, reply_markup=reply_markup)
-                        else:
-                            sent_message = await context.bot.send_document(
-                                chat_id=update.callback_query.message.chat_id,
-                                document=pdf_file,
-                                reply_markup=reply_markup
-                            )
-
-                        # Сохраняем данные о сообщении и шаблоне
-                        pdf_data[sent_message.message_id] = template
-
-                        # Обновляем историю PDF для пользователя
-                        user_id = update.effective_user.id
-                        if user_id not in user_pdf_history:
-                            user_pdf_history[user_id] = []
-                        user_pdf_history[user_id].append(sent_message.message_id)
-
-                    logging.info(f"PDF отправлен: {pdf_path}")
-                    await safe_delete_message(context.bot, waiting_message.chat_id, waiting_message.message_id)
-                else:
-                    await update.message.reply_text(f'Не удалось создать PDF для шаблона {template}. Попробуйте снова.')
-                    await safe_delete_message(context.bot, waiting_message.chat_id, waiting_message.message_id)
-            except asyncio.TimeoutError:
-                await update.message.reply_text("Время ожидания создания PDF истекло. Попробуйте позже.")
-            except Exception as e:
-                logging.error(f"Ошибка генерации PDF: {e}")
-        else:
-            await update.message.reply_text(f'Не удалось найти шаблоны для категории {category}. Попробуйте снова.')
-    else:
-        await update.message.reply_text(f'Не удалось найти шаблоны для категории {category}. Попробуйте снова.')
 
 async def safe_delete_message(bot, chat_id, message_id):
     """Пробует удалить сообщение, если оно существует."""
@@ -129,40 +95,133 @@ async def safe_delete_message(bot, chat_id, message_id):
     except Exception as e:
         logging.error(f"Ошибка при удалении сообщения с ID: {message_id}: {e}")
 
+async def generate_and_send_pdf(update: Update, context: CallbackContext, category: str, category_key: str) -> None:
+    try:
+        # Асинхронно получаем шаблоны
+        templates = await get_templates(category_key)
+        logging.info(f"Templates found: {templates}")
+
+        if templates:
+            template = get_random_template(templates)
+            logging.info(f"Selected template: {template}")
+            if template:
+                waiting_message = None
+                if update.message:
+                    waiting_message = await update.message.reply_text('Создание PDF... Пожалуйста, подождите.')
+                elif update.callback_query:
+                    waiting_message = await context.bot.send_message(
+                        chat_id=update.callback_query.message.chat_id,
+                        text='Создание PDF... Пожалуйста, подождите.'
+                    )
+
+                # Создаем временную директорию
+                temp_dir = Path(f"temp_{uuid.uuid4().hex}")
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                TEMP_DIRS[temp_dir] = datetime.now()
+
+                # Сохраняем шаблон в user_data до создания PDF
+                context.user_data['last_template'] = template
+
+                try:
+                    # Увеличиваем тайм-аут
+                    pdf_path = await asyncio.wait_for(
+                        generate_pdf(template, temp_dir, context.bot, waiting_message.chat_id, waiting_message.message_id),
+                        timeout=3600  # Увеличиваем тайм-аут до 1 часа
+                    )
+                except asyncio.TimeoutError:
+                    await update.message.reply_text("Время ожидания создания PDF истекло. Попробуйте позже.")
+                    raise
+                except Exception as e:
+                    logging.error(f"Ошибка генерации PDF: {e}")
+                    await update.message.reply_text(f'Не удалось создать PDF для шаблона {template}. Попробуйте снова.')
+                    raise
+
+                if pdf_path:
+                    pdf_filename = Path(pdf_path).name  # Извлекаем имя файла
+                    async with aiofiles.open(pdf_path, 'rb') as pdf_file:
+                        pdf_content = await pdf_file.read()  # Асинхронное чтение файла
+                        reply_markup = InlineKeyboardMarkup([[CONTACT_BUTTON], [NEW_PDF_BUTTON]])
+
+                        if update.message:
+                            sent_message = await update.message.reply_document(
+                                pdf_content, filename=pdf_filename
+                            )
+                        else:
+                            sent_message = await context.bot.send_document(
+                                chat_id=update.callback_query.message.chat_id,
+                                document=pdf_content,
+                                filename=pdf_filename
+                            )
+
+                        pdf_data[sent_message.message_id] = template  # Сохраняем шаблон для сообщения
+                        user_id = update.effective_user.id
+                        if user_id not in user_pdf_history:
+                            user_pdf_history[user_id] = []
+                        user_pdf_history[user_id].append(sent_message.message_id)
+
+                    logging.info(f"PDF отправлен: {pdf_path}")
+                    await safe_delete_message(context.bot, waiting_message.chat_id, waiting_message.message_id)
+
+                    # Отправляем сообщение с вопросом и кнопками
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="Сайт был сделан. Что теперь ты бы хотел сделать дальше? Выбери из двух вариантов:",
+                        reply_markup=reply_markup
+                    )
+
+                    # Удаляем временные файлы после отправки
+                    await asyncio.sleep(25)  # Добавляем задержку перед удалением файлов
+                    try:
+                        shutil.rmtree(temp_dir)
+                        TEMP_DIRS.pop(temp_dir, None)
+                        logging.info(f"Временная директория удалена: {temp_dir}")
+                    except Exception as e:
+                        logging.error(f"Ошибка при удалении временной директории {temp_dir}: {e}")
+                else:
+                    await update.message.reply_text(f'Не удалось создать PDF для шаблона {template}. Попробуйте снова.')
+                    await safe_delete_message(context.bot, waiting_message.chat_id, waiting_message.message_id)
+            else:
+                await update.message.reply_text(f'Не удалось найти шаблоны для категории {category}. Попробуйте снова.')
+        else:
+            await update.message.reply_text(f'Не удалось найти шаблоны для категории {category}. Попробуйте снова.')
+    except Exception as e:
+        logging.error(f"Ошибка в процессе генерации и отправки PDF: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке запроса. Попробуйте снова.")
+
+
+
 async def handle_button_click(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
-    if query.data == 'contact':
-        await query.answer()
+    
+    try:
+        # Немедленный ответ на callback_query, чтобы предотвратить его устаревание
+        await query.answer(text="Ваш запрос обрабатывается...")
 
-        # Получаем шаблон, который связан с сообщением
-        template_url = pdf_data.get(query.message.message_id)
+        if query.data == 'contact':
+            template_url = context.user_data.get('last_template')
 
-        if template_url:
-            await query.message.reply_text("Пожалуйста, введите ваш адрес электронной почты.")
-            context.user_data['waiting_for_email'] = True
-            context.user_data['template_url'] = template_url  # Сохраняем этот URL для отправки в группу
-            logging.info(f"Waiting for email input from user. Associated template: {template_url}")
-        else:
-            # Если шаблон не найден в конкретном сообщении, используем последний созданный шаблон
-            last_template = context.user_data.get('last_template')
-            if last_template:
-                context.user_data['template_url'] = last_template
+            if template_url:
                 await query.message.reply_text("Пожалуйста, введите ваш адрес электронной почты.")
                 context.user_data['waiting_for_email'] = True
-                logging.info(f"Using last template. Associated template: {last_template}")
+                context.user_data['template_url'] = template_url
+                logging.info(f"Waiting for email input from user. Associated template: {template_url}")
             else:
                 await query.message.reply_text("Ошибка: шаблон не найден.")
-    elif query.data == 'new_pdf':
-        await query.answer()
+        
+        elif query.data == 'new_pdf':
+            category_key = context.user_data.get('current_category')
+            category_name = next((k for k, v in category_mapping.items() if v == category_key), None)
 
-        # Используем сохраненную категорию для генерации нового PDF
-        category_key = context.user_data.get('current_category')
-        category_name = next((k for k, v in category_mapping.items() if v == category_key), None)
+            if category_key and category_name:
+                await generate_and_send_pdf(update, context, category_name, category_key)
+            else:
+                await query.message.reply_text("Ошибка: категория не найдена.")
 
-        if category_key and category_name:
-            await generate_and_send_pdf(update, context, category_name, category_key)
-        else:
-            await query.message.reply_text("Ошибка: категория не найдена.")
+    except BadRequest as e:
+        logging.error(f"Error in handling button click: {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Произошла ошибка при обработке вашего запроса. Попробуйте снова.")
+
+
 
 async def handle_email_input(update: Update, context: CallbackContext) -> None:
     logging.info(f"Received message: {update.message.text}")
@@ -192,10 +251,14 @@ async def handle_email_input(update: Update, context: CallbackContext) -> None:
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
 
+    # Добавляем обработчики команд и сообщений
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^(Technology|Design|Business|Blog|Marketing|Photography & Video|Entertainment|Food & drink|Travel|Education|Sports|Medical|Beauty & Wellness|Fashion) Websites$'), handle_category_selection))
     application.add_handler(CallbackQueryHandler(handle_button_click))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'.*@.*\..*'), handle_email_input))
+
+    # Запускаем фоновую задачу для очистки временных директорий
+    application.job_queue.run_repeating(cleanup_temp_dirs, interval=60)
 
     application.run_polling()
 
