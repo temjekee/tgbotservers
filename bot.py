@@ -19,9 +19,7 @@ GROUP_CHAT_ID = -1002201196372
 
 # Настройка Celery для взаимодействия с Redis
 celery_app = Celery('tasks', broker='redis://localhost:6379/0', backend='redis://localhost:6379/0')
-
 logging.basicConfig(level=logging.INFO)
-
 bot = Bot(token=TOKEN)
 
 # Глобальные переменные для кнопок и категорий
